@@ -4,7 +4,6 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 const axios = require("axios");
 const cors = require("cors");
-const serverless = require("serverless-http"); // Required for Vercel
 require("dotenv").config();
 
 const app = express();
@@ -12,24 +11,26 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 // --------------------
-// DB Connection (serverless safe)
+// DB Connection (global cached for Vercel cold starts)
 // --------------------
-let isConnected;
-async function connectDB() {
-  if (isConnected) return;
-  await mongoose.connect(process.env.MONGO_URI, {
+if (!global._mongoClientPromise) {
+  global._mongoClientPromise = mongoose.connect(process.env.MONGO_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
     maxPoolSize: 5,
   });
-  isConnected = true;
-  console.log("MongoDB connected ✅");
+}
+async function connectDB() {
+  await global._mongoClientPromise;
 }
 
 // --------------------
-// Multer (memory storage, no disk writes on Vercel)
+// Multer (memory storage with size limit)
 // --------------------
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB max
+});
 
 // --------------------
 // Schemas & Models
@@ -66,26 +67,17 @@ const Order =
 // --------------------
 app.get("/", (req, res) => res.json({ message: "API is running 🚀" }));
 
-// Create Product
-app.post("/products", upload.single("image"), async (req, res) => {
+// ⚡️ Direct image URL version: upload to imgbb from frontend
+app.post("/products", async (req, res) => {
   try {
     await connectDB();
 
-    if (!req.file) return res.status(400).json({ error: "No image uploaded" });
-
-    // Upload to imgbb
-    const base64Image = req.file.buffer.toString("base64");
-    const imgbbRes = await axios.post(
-      `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-      { image: base64Image },
-      { headers: { "Content-Type": "application/json" } }
-    );
-
+    // Frontend should send imgbb URL directly in req.body.imageUrl
     const product = new Product({
       name: req.body.name,
       price: req.body.price,
       category: req.body.category,
-      imageUrl: imgbbRes.data.data.url,
+      imageUrl: req.body.imageUrl, // already hosted image URL
     });
 
     await product.save();
@@ -93,6 +85,26 @@ app.post("/products", upload.single("image"), async (req, res) => {
   } catch (err) {
     console.error("Error creating product:", err);
     res.status(500).json({ error: "Failed to create product" });
+  }
+});
+
+// (optional) If you still want API to upload to imgbb, keep this route:
+app.post("/products/upload", upload.single("image"), async (req, res) => {
+  try {
+    await connectDB();
+    if (!req.file) return res.status(400).json({ error: "No image uploaded" });
+
+    const base64Image = req.file.buffer.toString("base64");
+    const imgbbRes = await axios.post(
+      `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+      { image: base64Image },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    res.json({ imageUrl: imgbbRes.data.data.url });
+  } catch (err) {
+    console.error("Error uploading to imgbb:", err);
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
@@ -178,11 +190,6 @@ app.delete("/orders/:id", async (req, res) => {
 });
 
 // --------------------
-// Local Dev & Vercel Export
+// Export for Vercel Serverless
 // --------------------
-if (process.env.NODE_ENV !== "production") {
-  const port = process.env.PORT || 3000;
-  app.listen(port, () => console.log(`Local API running at ${port}`));
-}
-
-module.exports = require("serverless-http")(app);
+module.exports = app;
